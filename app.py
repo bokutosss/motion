@@ -383,6 +383,8 @@ def detector_loop():
                             or time.monotonic() - state.phone_frame_at > 2):
                         state.camera_ok = False
                         state.motion = False
+                        state.primary_object = "none"
+                        state.body_parts = []
                     state.frame_cond.wait(timeout=1)
                     continue
                 frame = state.phone_frame.copy()
@@ -395,6 +397,8 @@ def detector_loop():
             if SOURCE == "phone":
                 state.camera_ok = False
                 state.motion = False
+                state.primary_object = "none"
+                state.body_parts = []
                 time.sleep(1)
                 continue
             if cap is None or not cap.isOpened():
