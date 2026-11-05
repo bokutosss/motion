@@ -37,6 +37,9 @@ parser.add_argument("--min-area", type=int, default=int(os.environ.get("MIN_AREA
                     help="Smallest moving blob (pixels) that counts as motion. Higher = less sensitive.")
 parser.add_argument("--confirm-frames", type=int, default=int(os.environ.get("CONFIRM_FRAMES", "3")),
                     help="Consecutive motion frames required before recording an event.")
+parser.add_argument("--object-confidence", type=float,
+                    default=float(os.environ.get("OBJECT_CONFIDENCE", "0.60")),
+                    help="Minimum confidence for showing an identified object (0-1).")
 parser.add_argument("--cooldown", type=float, default=float(os.environ.get("COOLDOWN", "10")),
                     help="Seconds of stillness before a new motion event can start.")
 parser.add_argument("--user", default=os.environ.get("ACCESS_USER", "admin"))
@@ -49,6 +52,8 @@ if bool(args.cert) != bool(args.key):
     parser.error("--cert and --key must be provided together")
 if args.confirm_frames < 1:
     parser.error("--confirm-frames must be at least 1")
+if not 0 < args.object_confidence < 1:
+    parser.error("--object-confidence must be greater than 0 and less than 1")
 
 SOURCE = int(args.source) if str(args.source).isdigit() else args.source
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -120,9 +125,10 @@ POSE_CONNECTIONS = (
 BODY_PART_IDS = (0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28)
 
 
-def download_model_file(path, url):
+def download_model_file(path, url, status):
     if os.path.isfile(path) and os.path.getsize(path) > 0:
         return
+    state.object_model = status
     response = requests.get(url, stream=True, timeout=(10, 120))
     response.raise_for_status()
     temporary_path = path + ".part"
@@ -141,9 +147,13 @@ class ObjectDetector:
         os.makedirs(model_dir, exist_ok=True)
         self.object_model_path = os.path.join(model_dir, "object_detection_yolox.onnx")
         self.pose_model_path = os.path.join(model_dir, "pose_estimation_mediapipe.onnx")
-        download_model_file(self.object_model_path, OBJECT_MODEL_URLS["objects"])
-        download_model_file(self.pose_model_path, OBJECT_MODEL_URLS["pose"])
+        download_model_file(self.object_model_path, OBJECT_MODEL_URLS["objects"],
+                    "downloading object model")
+        download_model_file(self.pose_model_path, OBJECT_MODEL_URLS["pose"],
+                    "downloading pose model")
+        state.object_model = "loading object model"
         self.net = cv2.dnn.readNet(self.object_model_path)
+        state.object_model = "loading pose model"
         self.pose_net = cv2.dnn.readNet(self.pose_model_path)
         for net in (self.net, self.pose_net):
             net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
@@ -156,6 +166,7 @@ class ObjectDetector:
             self.strides.append(np.full((side * side, 1), stride, dtype=np.float32))
         self.grids = np.concatenate(self.grids).astype(np.float32)
         self.strides = np.concatenate(self.strides)
+        state.object_model = "ready"
 
     def detect(self, frame):
         height, width = frame.shape[:2]
@@ -177,10 +188,12 @@ class ObjectDetector:
                                  output[:, 1] - output[:, 3] / 2,
                                  output[:, 2], output[:, 3]))
         kept_indices = []
-        for class_id in np.unique(class_ids[confidences >= 0.35]):
-            class_indices = np.flatnonzero((class_ids == class_id) & (confidences >= 0.35))
+        for class_id in np.unique(class_ids[confidences >= args.object_confidence]):
+            class_indices = np.flatnonzero(
+                (class_ids == class_id) & (confidences >= args.object_confidence))
             keep = cv2.dnn.NMSBoxes(boxes[class_indices].tolist(),
-                                    confidences[class_indices].tolist(), 0.35, 0.45)
+                                    confidences[class_indices].tolist(),
+                                    args.object_confidence, 0.45)
             kept_indices.extend(class_indices[np.asarray(keep).reshape(-1)].tolist())
         for index in sorted(kept_indices, key=lambda item: confidences[item], reverse=True)[:12]:
             x, y, box_width, box_height = boxes[index]
@@ -332,6 +345,7 @@ def record_event(frame, objects, body_parts):
 # --------------------------------------------------------------------------
 def detector_loop():
     bg = cv2.createBackgroundSubtractorMOG2(history=300, varThreshold=40, detectShadows=True)
+    state.object_model = "initializing"
     try:
         object_detector = ObjectDetector()
         state.object_model = "ready"
