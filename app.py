@@ -151,6 +151,7 @@ class ObjectDetector:
                     "downloading object model")
         download_model_file(self.pose_model_path, OBJECT_MODEL_URLS["pose"],
                     "downloading pose model")
+        cv2.setNumThreads(1)
         state.object_model = "loading object model"
         self.net = cv2.dnn.readNet(self.object_model_path)
         state.object_model = "loading pose model"
