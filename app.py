@@ -386,7 +386,7 @@ DASHBOARD = """<!doctype html>
       </div>
       <img class="qr" src="/qr.png" alt="QR code to open Motion System on your phone">
     </div>
-    <div class="camera-note">To use the browser camera, open this page over HTTPS and tap “Connect phone camera.” An IP Webcam app stream must still be configured with <code>--source</code> on the computer.</div>
+    <div class="camera-note">Connect a webcam below. Motion is detected automatically and snapshots appear in Recent motion. Camera access requires HTTPS or localhost.</div>
   </div>
 
   <div class="card">
@@ -394,12 +394,12 @@ DASHBOARD = """<!doctype html>
     <div class="row" style="margin-top:12px">
       <span id="badge" class="badge">Connecting...</span>
       <div class="row">
-        <button id="phoneBtn" class="secondary">Connect phone camera</button>
+        <button id="phoneBtn" class="secondary">Connect webcam</button>
         <button id="armBtn" class="secondary">Pause</button>
       </div>
     </div>
     <div class="meta" id="meta"></div>
-    <div class="camera-note" id="cameraNote">Phone camera requires permission and a secure page (HTTPS or localhost).</div>
+    <div class="camera-note" id="cameraNote">Webcam access requires permission and a secure page (HTTPS or localhost).</div>
     <video id="phoneVideo" autoplay playsinline muted hidden></video>
   </div>
 
@@ -429,7 +429,7 @@ async function refresh() {
     else if (s.motion) { badge.className = 'badge motion'; badge.textContent = 'MOTION DETECTED'; }
     else { badge.className = 'badge armed'; badge.textContent = 'Armed - all quiet'; }
     armBtn.textContent = s.armed ? 'Pause' : 'Resume';
-    if (!phoneStream && !s.phone_mode) phoneBtn.textContent = 'Connect phone camera';
+    if (!phoneStream && !s.phone_mode) phoneBtn.textContent = 'Connect webcam';
     meta.textContent = 'Last motion: ' + (s.last_motion || 'none yet') + '  |  ' + s.fps + ' fps';
 
     if (s.motion && !wasMotion) {
@@ -476,7 +476,7 @@ async function stopPhoneCamera() {
   if (phoneStream) phoneStream.getTracks().forEach(track => track.stop());
   phoneStream = null;
   phoneVideo.srcObject = null;
-  phoneBtn.textContent = 'Connect phone camera';
+  phoneBtn.textContent = 'Connect webcam';
   try { await fetch('/api/camera/disconnect', { method: 'POST' }); }
   catch (e) { cameraNote.textContent = 'Could not notify the server that the camera disconnected.'; }
 }
@@ -495,13 +495,13 @@ phoneBtn.onclick = async () => {
     const connected = await fetch('/api/camera/connect', { method: 'POST' });
     if (!connected.ok) throw new Error('Could not connect the phone camera to the server.');
     phoneStream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: { ideal: 'environment' }, width: { ideal: 640 } },
+      video: { width: { ideal: 640 } },
       audio: false
     });
     phoneVideo.srcObject = phoneStream;
     await phoneVideo.play();
-    phoneBtn.textContent = 'Disconnect phone camera';
-    cameraNote.textContent = 'Phone camera connected.';
+    phoneBtn.textContent = 'Disconnect webcam';
+    cameraNote.textContent = 'Webcam connected. Motion detection is active.';
     sendPhoneFrames();
   } catch (e) {
     await stopPhoneCamera();
