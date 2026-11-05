@@ -1,0 +1,6 @@
+Flask
+numpy
+opencv-python
+requests
+qrcode[pil]
+gunicorn; sys_platform != "win32"

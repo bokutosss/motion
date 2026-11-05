@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Motion System Requirements</title>
+</head>
+<body>
+  <main>
+    <h1>Motion System requirements</h1>
+    <p>Install Python, then install the packages listed in <code>requirements.txt</code>:</p>
+    <pre>python -m pip install -r requirements.txt</pre>
+    <p>The dashboard QR code opens the dashboard on a phone on the same Wi-Fi. It does not configure the IP Webcam app itself; use <code>--source http://PHONE_IP:8080/video</code> to select that app's stream.</p>
+
+    <h2>Deploy on Render</h2>
+    <ol>
+      <li>Push this project, including <code>render.yaml</code>, to a GitHub repository.</li>
+      <li>In Render, choose <strong>New</strong> &gt; <strong>Blueprint</strong> and connect that repository.</li>
+      <li>Deploy the <code>motion-system</code> web service defined in the blueprint. Render provides its HTTPS address and a generated dashboard password in the service's environment settings.</li>
+      <li>Open the Render HTTPS address on your phone, sign in, then choose <strong>Connect phone camera</strong> and allow camera access.</li>
+    </ol>
+    <p>For deployment, the QR code points to the Render HTTPS address. Motion snapshots are stored on the service's local disk and may not persist through a redeploy or restart.</p>
+
+    <h2>Connect a phone camera</h2>
+    <ol>
+      <li>Start the app on a computer connected to the same Wi-Fi network as your phone.</li>
+      <li>Open the app's printed HTTPS address on the phone and select <strong>Connect phone camera</strong>.</li>
+      <li>Allow camera access when prompted. The phone must trust the TLS certificate; camera access is also allowed on localhost.</li>
+    </ol>
+    <p>To serve HTTPS, provide a certificate and matching private key:
+      <code>python app.py --cert path\to\certificate.pem --key path\to\private-key.pem</code>.
+      Both options are required together.</p>
+    <p>For a separate IP camera app, start the app with
+      <code>python app.py --source http://PHONE_IP:8080/video</code>.
+      Set <code>--password</code> to protect the dashboard on a shared network.</p>
+  </main>
+</body>
+</html>
