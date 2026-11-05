@@ -75,6 +75,8 @@ class State:
         self.phone_frame_at = 0.0
         self.frame_cond = threading.Condition()
         self.object_model = "starting"
+        self.primary_object = "none"
+        self.body_parts = []
         self.events = deque(maxlen=50)   # newest first
 
 
@@ -85,15 +87,37 @@ state = State()
 # Object recognition
 # --------------------------------------------------------------------------
 OBJECT_CLASSES = (
-    "background", "airplane", "bicycle", "bird", "boat", "bottle", "bus",
-    "car", "cat", "chair", "cow", "dining table", "dog", "horse",
-    "motorcycle", "person", "potted plant", "sheep", "sofa", "train",
-    "tv monitor",
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck",
+    "boat", "traffic light", "fire hydrant", "stop sign", "parking meter", "bench",
+    "bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra",
+    "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
+    "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove",
+    "skateboard", "surfboard", "tennis racket", "bottle", "wine glass", "cup", "fork",
+    "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange", "broccoli",
+    "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch", "potted plant",
+    "bed", "dining table", "toilet", "tv", "laptop", "mouse", "remote", "keyboard",
+    "cell phone", "microwave", "oven", "toaster", "sink", "refrigerator", "book",
+    "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush",
 )
 OBJECT_MODEL_URLS = {
-    "prototxt": "https://raw.githubusercontent.com/chuanqi305/MobileNet-SSD/master/deploy.prototxt",
-    "weights": "https://raw.githubusercontent.com/chuanqi305/MobileNet-SSD/master/mobilenet_iter_73000.caffemodel",
+    "objects": "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/object_detection_yolox/object_detection_yolox_2022nov_int8.onnx",
+    "pose": "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/pose_estimation_mediapipe/pose_estimation_mediapipe_2023mar_int8bq.onnx",
 }
+POSE_NAMES = (
+    "nose", "left eye inner", "left eye", "left eye outer", "right eye inner",
+    "right eye", "right eye outer", "left ear", "right ear", "mouth left",
+    "mouth right", "left shoulder", "right shoulder", "left elbow", "right elbow",
+    "left wrist", "right wrist", "left pinky", "right pinky", "left index",
+    "right index", "left thumb", "right thumb", "left hip", "right hip", "left knee",
+    "right knee", "left ankle", "right ankle", "left heel", "right heel",
+    "left foot", "right foot",
+)
+POSE_CONNECTIONS = (
+    (11, 12), (11, 13), (13, 15), (12, 14), (14, 16), (11, 23), (12, 24),
+    (23, 24), (23, 25), (25, 27), (24, 26), (26, 28), (27, 29), (29, 31),
+    (28, 30), (30, 32), (0, 7), (0, 8),
+)
+BODY_PART_IDS = (0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28)
 
 
 def download_model_file(path, url):
@@ -111,38 +135,93 @@ def download_model_file(path, url):
 
 class ObjectDetector:
     def __init__(self):
-        model_dir = os.path.join(os.path.expanduser("~"), ".cache", "motion")
+        configured_dir = os.environ.get("MODEL_CACHE_DIR")
+        model_dir = (os.path.join(BASE_DIR, configured_dir) if configured_dir and not os.path.isabs(configured_dir)
+                     else configured_dir or os.path.join(os.path.expanduser("~"), ".cache", "motion"))
         os.makedirs(model_dir, exist_ok=True)
-        prototxt = os.path.join(model_dir, "mobilenet_ssd.prototxt")
-        weights = os.path.join(model_dir, "mobilenet_ssd.caffemodel")
-        download_model_file(prototxt, OBJECT_MODEL_URLS["prototxt"])
-        download_model_file(weights, OBJECT_MODEL_URLS["weights"])
-        self.net = cv2.dnn.readNetFromCaffe(prototxt, weights)
-        self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
-        self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+        self.object_model_path = os.path.join(model_dir, "object_detection_yolox.onnx")
+        self.pose_model_path = os.path.join(model_dir, "pose_estimation_mediapipe.onnx")
+        download_model_file(self.object_model_path, OBJECT_MODEL_URLS["objects"])
+        download_model_file(self.pose_model_path, OBJECT_MODEL_URLS["pose"])
+        self.net = cv2.dnn.readNet(self.object_model_path)
+        self.pose_net = cv2.dnn.readNet(self.pose_model_path)
+        for net in (self.net, self.pose_net):
+            net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+            net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+        self.grids, self.strides = [], []
+        for stride in (8, 16, 32):
+            side = 640 // stride
+            grid_x, grid_y = np.meshgrid(np.arange(side), np.arange(side))
+            self.grids.append(np.stack((grid_x, grid_y), axis=2).reshape(-1, 2))
+            self.strides.append(np.full((side * side, 1), stride, dtype=np.float32))
+        self.grids = np.concatenate(self.grids).astype(np.float32)
+        self.strides = np.concatenate(self.strides)
 
     def detect(self, frame):
         height, width = frame.shape[:2]
-        blob = cv2.dnn.blobFromImage(frame, 0.007843, (300, 300), 127.5)
+        scale = min(640 / width, 640 / height)
+        resized_width, resized_height = int(width * scale), int(height * scale)
+        resized = cv2.resize(frame, (resized_width, resized_height)).astype(np.float32)
+        input_frame = np.full((640, 640, 3), 114, dtype=np.float32)
+        input_frame[:resized_height, :resized_width] = resized
+        blob = np.transpose(input_frame, (2, 0, 1))[None]
         self.net.setInput(blob)
-        output = self.net.forward()[0, 0]
+        output = self.net.forward()[0].copy()
+        output[:, :2] = (output[:, :2] + self.grids) * self.strides
+        output[:, 2:4] = np.exp(np.clip(output[:, 2:4], -10, 10)) * self.strides
+        scores = output[:, 4:5] * output[:, 5:]
+        class_ids = np.argmax(scores, axis=1)
+        confidences = scores[np.arange(len(scores)), class_ids]
         detections = []
-        for row in output:
-            confidence = float(row[2])
-            class_id = int(row[1])
-            if confidence < 0.4 or not 0 < class_id < len(OBJECT_CLASSES):
-                continue
-            x1 = max(0, min(width - 1, int(row[3] * width)))
-            y1 = max(0, min(height - 1, int(row[4] * height)))
-            x2 = max(0, min(width - 1, int(row[5] * width)))
-            y2 = max(0, min(height - 1, int(row[6] * height)))
+        boxes = np.column_stack((output[:, 0] - output[:, 2] / 2,
+                                 output[:, 1] - output[:, 3] / 2,
+                                 output[:, 2], output[:, 3]))
+        kept_indices = []
+        for class_id in np.unique(class_ids[confidences >= 0.35]):
+            class_indices = np.flatnonzero((class_ids == class_id) & (confidences >= 0.35))
+            keep = cv2.dnn.NMSBoxes(boxes[class_indices].tolist(),
+                                    confidences[class_indices].tolist(), 0.35, 0.45)
+            kept_indices.extend(class_indices[np.asarray(keep).reshape(-1)].tolist())
+        for index in sorted(kept_indices, key=lambda item: confidences[item], reverse=True)[:12]:
+            x, y, box_width, box_height = boxes[index]
+            x1 = max(0, min(width - 1, int(x / scale)))
+            y1 = max(0, min(height - 1, int(y / scale)))
+            x2 = max(0, min(width - 1, int((x + box_width) / scale)))
+            y2 = max(0, min(height - 1, int((y + box_height) / scale)))
             if x2 > x1 and y2 > y1:
                 detections.append({
-                    "label": OBJECT_CLASSES[class_id],
-                    "confidence": confidence,
+                    "label": OBJECT_CLASSES[class_ids[index]],
+                    "confidence": float(confidences[index]),
                     "box": (x1, y1, x2 - x1, y2 - y1),
                 })
         return detections
+
+    def detect_pose(self, frame, box):
+        x, y, width, height = box
+        side = max(32, int(max(width, height) * 1.25))
+        left = int(x + width / 2 - side / 2)
+        top = int(y + height / 2 - side / 2)
+        crop = np.zeros((side, side, 3), dtype=np.uint8)
+        x1, y1 = max(0, left), max(0, top)
+        x2, y2 = min(frame.shape[1], left + side), min(frame.shape[0], top + side)
+        crop[y1 - top:y2 - top, x1 - left:x2 - left] = frame[y1:y2, x1:x2]
+        pose_input = cv2.resize(crop, (256, 256))
+        pose_input = cv2.cvtColor(pose_input, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        self.pose_net.setInput(pose_input[None])
+        landmarks, confidence, _, _, _ = self.pose_net.forward(
+            self.pose_net.getUnconnectedOutLayersNames())
+        if float(confidence[0][0]) < 0.5:
+            return []
+        landmarks = landmarks[0].reshape(-1, 5)
+        visibility = 1 / (1 + np.exp(-np.clip(landmarks[:, 3], -30, 30)))
+        points = []
+        center_x, center_y = left + side / 2, top + side / 2
+        for index, name in enumerate(POSE_NAMES):
+            px = int((landmarks[index, 0] - 128) * side / 256 + center_x)
+            py = int((landmarks[index, 1] - 128) * side / 256 + center_y)
+            points.append({"name": name, "x": px, "y": py,
+                           "visibility": float(visibility[index])})
+        return points
 
 
 def match_moving_objects(motion_boxes, detections):
@@ -161,6 +240,37 @@ def match_moving_objects(motion_boxes, detections):
         if best is not None:
             matches[index] = best
     return matches
+
+
+def select_primary_object(detections, motion_boxes, frame_shape):
+    if not detections:
+        return None
+    moving_ids = {id(detection) for detection in match_moving_objects(motion_boxes, detections).values()}
+    frame_area = max(1, frame_shape[0] * frame_shape[1])
+    return max(detections, key=lambda detection: (
+        detection["confidence"] + (0.5 if id(detection) in moving_ids else 0)
+        + 0.1 * (detection["box"][2] * detection["box"][3] / frame_area)))
+
+
+def body_part_names(points, threshold=0.6):
+    return [points[index]["name"] for index in BODY_PART_IDS
+            if index < len(points) and points[index]["visibility"] >= threshold]
+
+
+def draw_pose(frame, points):
+    visible = {index: point for index, point in enumerate(points)
+               if point["visibility"] >= 0.6
+               and 0 <= point["x"] < frame.shape[1]
+               and 0 <= point["y"] < frame.shape[0]}
+    for first, second in POSE_CONNECTIONS:
+        if first in visible and second in visible:
+            cv2.line(frame, (visible[first]["x"], visible[first]["y"]),
+                     (visible[second]["x"], visible[second]["y"]), (255, 220, 0), 2)
+    for index, point in visible.items():
+        cv2.circle(frame, (point["x"], point["y"]), 3, (0, 80, 255), -1)
+        if index in BODY_PART_IDS:
+            cv2.putText(frame, point["name"], (point["x"] + 4, point["y"] - 3),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.32, (255, 255, 255), 1)
 
 
 def extract_motion_boxes(mask, min_area):
@@ -198,18 +308,22 @@ def send_telegram(path, caption):
         print(f"[telegram] failed: {exc}")
 
 
-def record_event(frame, objects):
+def record_event(frame, objects, body_parts):
     now = dt.datetime.now()
     name = now.strftime("motion_%Y%m%d_%H%M%S.jpg")
     path = os.path.join(SNAP_DIR, name)
     cv2.imwrite(path, frame)
     event = {"time": now.strftime("%Y-%m-%d %H:%M:%S"), "file": name,
-             "objects": objects}
+             "objects": objects, "body_parts": body_parts}
     state.events.appendleft(event)
     state.last_motion = event["time"]
-    print(f"[motion] {event['time']} ({', '.join(objects) or 'unidentified'})")
+    print(f"[motion] {event['time']} ({', '.join(objects) or 'unidentified'}; "
+          f"body: {', '.join(body_parts) or 'none'})")
+    caption = f"Motion at {event['time']}: {', '.join(objects) or 'unidentified'}"
+    if body_parts:
+        caption += f"; visible body parts: {', '.join(body_parts)}"
     threading.Thread(target=send_telegram,
-                     args=(path, f"Motion detected at {event['time']}"),
+                     args=(path, caption),
                      daemon=True).start()
 
 
@@ -221,7 +335,7 @@ def detector_loop():
     try:
         object_detector = ObjectDetector()
         state.object_model = "ready"
-        print("[objects] MobileNet-SSD detector ready")
+        print("[objects] 80-class detector and 33-point pose model ready")
     except Exception as exc:
         object_detector = None
         state.object_model = "unavailable"
@@ -233,6 +347,8 @@ def detector_loop():
     last_seen = 0.0
     last_object_detection_at = 0.0
     object_detections = []
+    pose_points = []
+    primary_detection = None
     motion_history = deque(maxlen=args.confirm_frames)
     frames, t0 = 0, time.time()
 
@@ -299,29 +415,45 @@ def detector_loop():
         now = time.time()
         moving = confirmed_motion(motion_history, bool(boxes) and state.armed,
                                  args.confirm_frames)
-        if moving and object_detector and now - last_object_detection_at >= 0.5:
+        if object_detector and now - last_object_detection_at >= 0.75:
             try:
                 object_detections = object_detector.detect(frame)
+                primary_detection = select_primary_object(object_detections, boxes, frame.shape)
+                pose_points = (object_detector.detect_pose(frame, primary_detection["box"])
+                               if primary_detection and primary_detection["label"] == "person"
+                               else [])
+                state.primary_object = (primary_detection["label"]
+                                        if primary_detection else "none")
+                state.body_parts = body_part_names(pose_points)
                 last_object_detection_at = now
             except Exception as exc:
                 object_detector = None
                 object_detections = []
+                pose_points = []
+                primary_detection = None
+                state.primary_object = "none"
+                state.body_parts = []
                 state.object_model = "unavailable"
                 print(f"[objects] inference failed: {exc}")
-        elif not moving:
-            object_detections = []
-            last_object_detection_at = 0.0
         object_matches = match_moving_objects(boxes, object_detections) if moving else {}
         object_names = sorted({detection["label"] for detection in object_matches.values()})
 
         shown = frame.copy()
+        for detection in object_detections:
+            x, y, box_width, box_height = detection["box"]
+            focused = detection is primary_detection
+            color = (0, 215, 255) if focused else (255, 180, 0)
+            thickness = 3 if focused else 1
+            cv2.rectangle(shown, (x, y), (x + box_width, y + box_height), color, thickness)
+            prefix = "FOCUS: " if focused else ""
+            text = f"{prefix}{detection['label']} {detection['confidence']:.0%}"
+            cv2.putText(shown, text, (x, max(18, y - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, thickness)
+        if primary_detection and primary_detection["label"] == "person":
+            draw_pose(shown, pose_points)
         for index, (x, y, bw, bh) in enumerate(boxes):
-            cv2.rectangle(shown, (x, y), (x + bw, y + bh), (0, 255, 0), 2)
-            detection = object_matches.get(index)
-            if detection:
-                text = f"{detection['label']} {detection['confidence']:.0%}"
-                cv2.putText(shown, text, (x, max(18, y - 6)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            if index not in object_matches:
+                cv2.rectangle(shown, (x, y), (x + bw, y + bh), (0, 255, 0), 1)
         label = "MOTION" if state.motion else (
             "VERIFYING" if state.armed and any(motion_history)
             else ("ARMED" if state.armed else "PAUSED"))
@@ -333,7 +465,7 @@ def detector_loop():
             last_seen = now
             if not state.motion:
                 state.motion = True
-                record_event(shown, object_names)
+                record_event(shown, object_names or [state.primary_object], state.body_parts)
         elif state.motion and (now - last_seen > args.cooldown or not state.armed):
             state.motion = False
 
@@ -394,7 +526,8 @@ def api_status():
     return jsonify(motion=state.motion, armed=state.armed, camera_ok=state.camera_ok,
                    fps=round(state.fps, 1), last_motion=state.last_motion,
                    event_count=len(state.events), phone_mode=state.phone_mode,
-                   object_model=state.object_model)
+                   object_model=state.object_model, primary_object=state.primary_object,
+                   body_parts=state.body_parts)
 
 
 @app.route("/api/camera/connect", methods=["POST"])
@@ -405,6 +538,8 @@ def api_camera_connect():
         state.phone_frame_at = 0.0
         state.motion = False
         state.camera_ok = False
+        state.primary_object = "none"
+        state.body_parts = []
         state.frame_cond.notify_all()
     return jsonify(connected=True)
 
@@ -417,6 +552,8 @@ def api_camera_disconnect():
         state.phone_frame_at = 0.0
         state.motion = False
         state.camera_ok = False
+        state.primary_object = "none"
+        state.body_parts = []
         state.frame_cond.notify_all()
     return jsonify(connected=False)
 
@@ -566,8 +703,10 @@ async function refresh() {
     else { badge.className = 'badge armed'; badge.textContent = 'Armed - all quiet'; }
     armBtn.textContent = s.armed ? 'Pause' : 'Resume';
     if (!phoneStream && !s.phone_mode) phoneBtn.textContent = 'Connect webcam';
+        const bodyParts = (s.body_parts || []).join(', ');
         meta.textContent = 'Last motion: ' + (s.last_motion || 'none yet') + '  |  ' + s.fps +
-            ' fps  |  Object ID: ' + s.object_model;
+            ' fps  |  Model: ' + s.object_model + '  |  Focus: ' + (s.primary_object || 'none') +
+            (bodyParts ? '  |  Body: ' + bodyParts : '');
 
     if (s.motion && !wasMotion) {
       if (navigator.vibrate) navigator.vibrate([250, 120, 250]);
@@ -653,8 +792,10 @@ async function loadEvents() {
   if (!list.length) { eventsEl.innerHTML = '<div class="empty">No motion recorded yet.</div>'; return; }
     eventsEl.innerHTML = list.map(e => {
         const objects = (e.objects || []).join(', ') || 'unidentified object';
+        const bodyParts = (e.body_parts || []).join(', ');
         return '<figure><a href="/snapshots/' + e.file + '" target="_blank"><img loading="lazy" src="/snapshots/' + e.file +
-            '"></a><figcaption>' + e.time + ' - ' + objects + '</figcaption></figure>';
+            '"></a><figcaption>' + e.time + ' - ' + objects +
+            (bodyParts ? ' - ' + bodyParts : '') + '</figcaption></figure>';
     }).join('');
 }
 

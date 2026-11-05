@@ -3,9 +3,15 @@ services:
     name: motion-system
     runtime: python
     plan: free
-    buildCommand: pip install -r requirements.txt
+    buildCommand: >-
+      pip install -r requirements.txt &&
+      mkdir -p .model-cache &&
+      curl -fsSL --retry 3 --retry-delay 2 https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/object_detection_yolox/object_detection_yolox_2022nov_int8.onnx -o .model-cache/object_detection_yolox.onnx &&
+      curl -fsSL --retry 3 --retry-delay 2 https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/pose_estimation_mediapipe/pose_estimation_mediapipe_2023mar_int8bq.onnx -o .model-cache/pose_estimation_mediapipe.onnx
     startCommand: gunicorn --bind 0.0.0.0:$PORT --workers 1 --threads 8 wsgi:app
     healthCheckPath: /healthz
     envVars:
       - key: CAMERA_SOURCE
         value: phone
+      - key: MODEL_CACHE_DIR
+        value: .model-cache
