@@ -35,6 +35,8 @@ parser.add_argument("--key", default=os.environ.get("TLS_KEY", ""),
                     help="TLS private key file")
 parser.add_argument("--min-area", type=int, default=int(os.environ.get("MIN_AREA", "1500")),
                     help="Smallest moving blob (pixels) that counts as motion. Higher = less sensitive.")
+parser.add_argument("--confirm-frames", type=int, default=int(os.environ.get("CONFIRM_FRAMES", "3")),
+                    help="Consecutive motion frames required before recording an event.")
 parser.add_argument("--cooldown", type=float, default=float(os.environ.get("COOLDOWN", "10")),
                     help="Seconds of stillness before a new motion event can start.")
 parser.add_argument("--user", default=os.environ.get("ACCESS_USER", "admin"))
@@ -45,6 +47,8 @@ parser.add_argument("--telegram-chat", default=os.environ.get("TELEGRAM_CHAT_ID"
 args = parser.parse_args() if __name__ == "__main__" else parser.parse_args([])
 if bool(args.cert) != bool(args.key):
     parser.error("--cert and --key must be provided together")
+if args.confirm_frames < 1:
+    parser.error("--confirm-frames must be at least 1")
 
 SOURCE = int(args.source) if str(args.source).isdigit() else args.source
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -70,10 +74,110 @@ class State:
         self.phone_frame = None
         self.phone_frame_at = 0.0
         self.frame_cond = threading.Condition()
+        self.object_model = "starting"
         self.events = deque(maxlen=50)   # newest first
 
 
 state = State()
+
+
+# --------------------------------------------------------------------------
+# Object recognition
+# --------------------------------------------------------------------------
+OBJECT_CLASSES = (
+    "background", "airplane", "bicycle", "bird", "boat", "bottle", "bus",
+    "car", "cat", "chair", "cow", "dining table", "dog", "horse",
+    "motorcycle", "person", "potted plant", "sheep", "sofa", "train",
+    "tv monitor",
+)
+OBJECT_MODEL_URLS = {
+    "prototxt": "https://raw.githubusercontent.com/chuanqi305/MobileNet-SSD/master/deploy.prototxt",
+    "weights": "https://raw.githubusercontent.com/chuanqi305/MobileNet-SSD/master/mobilenet_iter_73000.caffemodel",
+}
+
+
+def download_model_file(path, url):
+    if os.path.isfile(path) and os.path.getsize(path) > 0:
+        return
+    response = requests.get(url, stream=True, timeout=(10, 120))
+    response.raise_for_status()
+    temporary_path = path + ".part"
+    with open(temporary_path, "wb") as model_file:
+        for chunk in response.iter_content(chunk_size=1024 * 1024):
+            if chunk:
+                model_file.write(chunk)
+    os.replace(temporary_path, path)
+
+
+class ObjectDetector:
+    def __init__(self):
+        model_dir = os.path.join(os.path.expanduser("~"), ".cache", "motion")
+        os.makedirs(model_dir, exist_ok=True)
+        prototxt = os.path.join(model_dir, "mobilenet_ssd.prototxt")
+        weights = os.path.join(model_dir, "mobilenet_ssd.caffemodel")
+        download_model_file(prototxt, OBJECT_MODEL_URLS["prototxt"])
+        download_model_file(weights, OBJECT_MODEL_URLS["weights"])
+        self.net = cv2.dnn.readNetFromCaffe(prototxt, weights)
+        self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+        self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+
+    def detect(self, frame):
+        height, width = frame.shape[:2]
+        blob = cv2.dnn.blobFromImage(frame, 0.007843, (300, 300), 127.5)
+        self.net.setInput(blob)
+        output = self.net.forward()[0, 0]
+        detections = []
+        for row in output:
+            confidence = float(row[2])
+            class_id = int(row[1])
+            if confidence < 0.4 or not 0 < class_id < len(OBJECT_CLASSES):
+                continue
+            x1 = max(0, min(width - 1, int(row[3] * width)))
+            y1 = max(0, min(height - 1, int(row[4] * height)))
+            x2 = max(0, min(width - 1, int(row[5] * width)))
+            y2 = max(0, min(height - 1, int(row[6] * height)))
+            if x2 > x1 and y2 > y1:
+                detections.append({
+                    "label": OBJECT_CLASSES[class_id],
+                    "confidence": confidence,
+                    "box": (x1, y1, x2 - x1, y2 - y1),
+                })
+        return detections
+
+
+def match_moving_objects(motion_boxes, detections):
+    matches = {}
+    for index, (x, y, width, height) in enumerate(motion_boxes):
+        motion_area = max(1, width * height)
+        best, best_score = None, 0.15
+        for detection in detections:
+            dx, dy, dw, dh = detection["box"]
+            intersection_width = max(0, min(x + width, dx + dw) - max(x, dx))
+            intersection_height = max(0, min(y + height, dy + dh) - max(y, dy))
+            intersection = intersection_width * intersection_height
+            overlap = intersection / max(1, min(motion_area, dw * dh))
+            if overlap >= best_score:
+                best, best_score = detection, overlap
+        if best is not None:
+            matches[index] = best
+    return matches
+
+
+def extract_motion_boxes(mask, min_area):
+    mask = cv2.threshold(mask, 200, 255, cv2.THRESH_BINARY)[1]
+    mask = cv2.morphologyEx(
+        mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+    mask = cv2.morphologyEx(
+        mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    mask = cv2.dilate(mask, None, iterations=1)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    return [cv2.boundingRect(contour) for contour in contours
+            if cv2.contourArea(contour) >= min_area]
+
+
+def confirmed_motion(history, moving, required_frames):
+    history.append(bool(moving))
+    return len(history) >= required_frames and all(history)
 
 
 # --------------------------------------------------------------------------
@@ -94,15 +198,16 @@ def send_telegram(path, caption):
         print(f"[telegram] failed: {exc}")
 
 
-def record_event(frame):
+def record_event(frame, objects):
     now = dt.datetime.now()
     name = now.strftime("motion_%Y%m%d_%H%M%S.jpg")
     path = os.path.join(SNAP_DIR, name)
     cv2.imwrite(path, frame)
-    event = {"time": now.strftime("%Y-%m-%d %H:%M:%S"), "file": name}
+    event = {"time": now.strftime("%Y-%m-%d %H:%M:%S"), "file": name,
+             "objects": objects}
     state.events.appendleft(event)
     state.last_motion = event["time"]
-    print(f"[motion] {event['time']}")
+    print(f"[motion] {event['time']} ({', '.join(objects) or 'unidentified'})")
     threading.Thread(target=send_telegram,
                      args=(path, f"Motion detected at {event['time']}"),
                      daemon=True).start()
@@ -112,12 +217,23 @@ def record_event(frame):
 # Detector thread
 # --------------------------------------------------------------------------
 def detector_loop():
-    bg = cv2.createBackgroundSubtractorMOG2(history=300, varThreshold=40, detectShadows=False)
+    bg = cv2.createBackgroundSubtractorMOG2(history=300, varThreshold=40, detectShadows=True)
+    try:
+        object_detector = ObjectDetector()
+        state.object_model = "ready"
+        print("[objects] MobileNet-SSD detector ready")
+    except Exception as exc:
+        object_detector = None
+        state.object_model = "unavailable"
+        print(f"[objects] detector unavailable: {exc}")
     cap = None
     warmup = 0
     phone_mode_active = False
     last_phone_frame_at = 0.0
     last_seen = 0.0
+    last_object_detection_at = 0.0
+    object_detections = []
+    motion_history = deque(maxlen=args.confirm_frames)
     frames, t0 = 0, time.time()
 
     while True:
@@ -178,18 +294,37 @@ def detector_loop():
         if warmup > 0:
             warmup -= 1
         else:
-            mask = cv2.threshold(mask, 200, 255, cv2.THRESH_BINARY)[1]
-            mask = cv2.dilate(mask, None, iterations=2)
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            boxes = [cv2.boundingRect(c) for c in contours if cv2.contourArea(c) >= args.min_area]
+            boxes = extract_motion_boxes(mask, args.min_area)
 
         now = time.time()
-        moving = bool(boxes) and state.armed
+        moving = confirmed_motion(motion_history, bool(boxes) and state.armed,
+                                 args.confirm_frames)
+        if moving and object_detector and now - last_object_detection_at >= 0.5:
+            try:
+                object_detections = object_detector.detect(frame)
+                last_object_detection_at = now
+            except Exception as exc:
+                object_detector = None
+                object_detections = []
+                state.object_model = "unavailable"
+                print(f"[objects] inference failed: {exc}")
+        elif not moving:
+            object_detections = []
+            last_object_detection_at = 0.0
+        object_matches = match_moving_objects(boxes, object_detections) if moving else {}
+        object_names = sorted({detection["label"] for detection in object_matches.values()})
 
         shown = frame.copy()
-        for (x, y, bw, bh) in boxes:
+        for index, (x, y, bw, bh) in enumerate(boxes):
             cv2.rectangle(shown, (x, y), (x + bw, y + bh), (0, 255, 0), 2)
-        label = "MOTION" if state.motion else ("ARMED" if state.armed else "PAUSED")
+            detection = object_matches.get(index)
+            if detection:
+                text = f"{detection['label']} {detection['confidence']:.0%}"
+                cv2.putText(shown, text, (x, max(18, y - 6)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        label = "MOTION" if state.motion else (
+            "VERIFYING" if state.armed and any(motion_history)
+            else ("ARMED" if state.armed else "PAUSED"))
         color = (0, 0, 255) if state.motion else (255, 255, 255)
         cv2.putText(shown, f"{label}  {dt.datetime.now():%H:%M:%S}", (10, 24),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
@@ -198,7 +333,7 @@ def detector_loop():
             last_seen = now
             if not state.motion:
                 state.motion = True
-                record_event(shown)
+                record_event(shown, object_names)
         elif state.motion and (now - last_seen > args.cooldown or not state.armed):
             state.motion = False
 
@@ -258,7 +393,8 @@ def video():
 def api_status():
     return jsonify(motion=state.motion, armed=state.armed, camera_ok=state.camera_ok,
                    fps=round(state.fps, 1), last_motion=state.last_motion,
-                   event_count=len(state.events), phone_mode=state.phone_mode)
+                   event_count=len(state.events), phone_mode=state.phone_mode,
+                   object_model=state.object_model)
 
 
 @app.route("/api/camera/connect", methods=["POST"])
@@ -430,7 +566,8 @@ async function refresh() {
     else { badge.className = 'badge armed'; badge.textContent = 'Armed - all quiet'; }
     armBtn.textContent = s.armed ? 'Pause' : 'Resume';
     if (!phoneStream && !s.phone_mode) phoneBtn.textContent = 'Connect webcam';
-    meta.textContent = 'Last motion: ' + (s.last_motion || 'none yet') + '  |  ' + s.fps + ' fps';
+        meta.textContent = 'Last motion: ' + (s.last_motion || 'none yet') + '  |  ' + s.fps +
+            ' fps  |  Object ID: ' + s.object_model;
 
     if (s.motion && !wasMotion) {
       if (navigator.vibrate) navigator.vibrate([250, 120, 250]);
@@ -514,9 +651,11 @@ phoneBtn.onclick = async () => {
 async function loadEvents() {
   const list = await (await fetch('/api/events')).json();
   if (!list.length) { eventsEl.innerHTML = '<div class="empty">No motion recorded yet.</div>'; return; }
-  eventsEl.innerHTML = list.map(e =>
-    '<figure><a href="/snapshots/' + e.file + '" target="_blank"><img loading="lazy" src="/snapshots/' + e.file +
-    '"></a><figcaption>' + e.time + '</figcaption></figure>').join('');
+    eventsEl.innerHTML = list.map(e => {
+        const objects = (e.objects || []).join(', ') || 'unidentified object';
+        return '<figure><a href="/snapshots/' + e.file + '" target="_blank"><img loading="lazy" src="/snapshots/' + e.file +
+            '"></a><figcaption>' + e.time + ' - ' + objects + '</figcaption></figure>';
+    }).join('');
 }
 
 armBtn.onclick = async () => {

@@ -1,6 +1,6 @@
 Flask
 numpy
-opencv-python
+opencv-python-headless<5
 requests
 qrcode[pil]
 gunicorn; sys_platform != "win32"
