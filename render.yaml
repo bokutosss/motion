@@ -9,5 +9,3 @@ services:
     envVars:
       - key: CAMERA_SOURCE
         value: phone
-      - key: ACCESS_PASSWORD
-        generateValue: true
