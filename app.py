@@ -712,6 +712,25 @@ const cameraNote = document.getElementById('cameraNote');
 const eventsEl = document.getElementById('events');
 let phoneStream = null, sendingFrames = false;
 
+function canUseCamera() {
+  return !!navigator.mediaDevices && !!navigator.mediaDevices.getUserMedia &&
+    (window.isSecureContext || location.hostname === 'localhost' || location.hostname === '127.0.0.1' || location.hostname.endsWith('.local'));
+}
+
+async function waitForVideoMetadata() {
+  if (phoneVideo.readyState >= 2 && phoneVideo.videoWidth > 0 && phoneVideo.videoHeight > 0) return;
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      phoneVideo.onloadedmetadata = null;
+      reject(new Error('Camera stream did not become ready. Try reconnecting the webcam.'));
+    }, 5000);
+    phoneVideo.onloadedmetadata = () => {
+      clearTimeout(timeout);
+      resolve();
+    };
+  });
+}
+
 async function refresh() {
   try {
     const s = await (await fetch('/api/status')).json();
@@ -722,10 +741,10 @@ async function refresh() {
     else { badge.className = 'badge armed'; badge.textContent = 'Armed - all quiet'; }
     armBtn.textContent = s.armed ? 'Pause' : 'Resume';
     if (!phoneStream && !s.phone_mode) phoneBtn.textContent = 'Connect webcam';
-        const bodyParts = (s.body_parts || []).join(', ');
-        meta.textContent = 'Last motion: ' + (s.last_motion || 'none yet') + '  |  ' + s.fps +
-            ' fps  |  Model: ' + s.object_model + '  |  Focus: ' + (s.primary_object || 'none') +
-            (bodyParts ? '  |  Body: ' + bodyParts : '');
+    const bodyParts = (s.body_parts || []).join(', ');
+    meta.textContent = 'Last motion: ' + (s.last_motion || 'none yet') + '  |  ' + s.fps +
+        ' fps  |  Model: ' + s.object_model + '  |  Focus: ' + (s.primary_object || 'none') +
+        (bodyParts ? '  |  Body: ' + bodyParts : '');
 
     if (s.motion && !wasMotion) {
       if (navigator.vibrate) navigator.vibrate([250, 120, 250]);
@@ -746,17 +765,20 @@ async function sendPhoneFrames() {
   const context = canvas.getContext('2d');
   try {
     while (phoneStream) {
-      if (phoneVideo.readyState >= 2) {
-        const scale = Math.min(1, 640 / phoneVideo.videoWidth);
-        canvas.width = Math.round(phoneVideo.videoWidth * scale);
-        canvas.height = Math.round(phoneVideo.videoHeight * scale);
-        context.drawImage(phoneVideo, 0, 0, canvas.width, canvas.height);
-        const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.75));
-        if (blob) {
-          const response = await fetch('/api/camera/frame', { method: 'POST', body: blob });
-          if (!response.ok) throw new Error('Server rejected a camera frame (' + response.status + ').');
-        }
+      if (!phoneVideo || phoneVideo.readyState < 2 || phoneVideo.videoWidth <= 0 || phoneVideo.videoHeight <= 0) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+        continue;
       }
+      const scale = Math.min(1, 640 / phoneVideo.videoWidth, 1080 / phoneVideo.videoHeight);
+      canvas.width = Math.round(phoneVideo.videoWidth * scale);
+      canvas.height = Math.round(phoneVideo.videoHeight * scale);
+      context.drawImage(phoneVideo, 0, 0, canvas.width, canvas.height);
+      const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.75));
+      if (!blob) {
+        throw new Error('Camera frame could not be captured. Try reconnecting the webcam.');
+      }
+      const response = await fetch('/api/camera/frame', { method: 'POST', headers: {'Content-Type': 'image/jpeg'}, body: blob });
+      if (!response.ok) throw new Error('Server rejected a camera frame (' + response.status + ').');
       await new Promise(resolve => setTimeout(resolve, 200));
     }
   } catch (e) {
@@ -784,17 +806,18 @@ phoneBtn.onclick = async () => {
       cameraNote.textContent = 'Phone camera disconnected.';
       return;
     }
-    if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    if (!canUseCamera()) {
       throw new Error('Phone camera access requires HTTPS (or localhost) and a supported browser.');
     }
     const connected = await fetch('/api/camera/connect', { method: 'POST' });
     if (!connected.ok) throw new Error('Could not connect the phone camera to the server.');
     phoneStream = await navigator.mediaDevices.getUserMedia({
-      video: { width: { ideal: 640 } },
+      video: { width: { ideal: 640 }, height: { ideal: 480 } },
       audio: false
     });
     phoneVideo.srcObject = phoneStream;
     await phoneVideo.play();
+    await waitForVideoMetadata();
     phoneBtn.textContent = 'Disconnect webcam';
     cameraNote.textContent = 'Webcam connected. Motion detection is active.';
     sendPhoneFrames();
