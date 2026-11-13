@@ -148,9 +148,9 @@ class ObjectDetector:
         self.object_model_path = os.path.join(model_dir, "object_detection_yolox.onnx")
         self.pose_model_path = os.path.join(model_dir, "pose_estimation_mediapipe.onnx")
         download_model_file(self.object_model_path, OBJECT_MODEL_URLS["objects"],
-                    "downloading object model")
+                           "downloading object model")
         download_model_file(self.pose_model_path, OBJECT_MODEL_URLS["pose"],
-                    "downloading pose model")
+                           "downloading pose model")
         cv2.setNumThreads(1)
         state.object_model = "loading object model"
         self.net = cv2.dnn.readNet(self.object_model_path)
@@ -682,7 +682,8 @@ DASHBOARD = """<!doctype html>
   </div>
 
   <div class="card">
-    <img class="video" src="/video" alt="Live camera">
+    <img id="serverVideo" class="video" src="/video" alt="Processed camera output">
+    <video id="livePreview" class="video" autoplay playsinline muted hidden></video>
     <div class="row" style="margin-top:12px">
       <span id="badge" class="badge">Connecting...</span>
       <div class="row">
@@ -708,6 +709,8 @@ const meta = document.getElementById('meta');
 const armBtn = document.getElementById('armBtn');
 const phoneBtn = document.getElementById('phoneBtn');
 const phoneVideo = document.getElementById('phoneVideo');
+const livePreview = document.getElementById('livePreview');
+const serverVideo = document.getElementById('serverVideo');
 const cameraNote = document.getElementById('cameraNote');
 const eventsEl = document.getElementById('events');
 let phoneStream = null, sendingFrames = false;
@@ -793,6 +796,10 @@ async function stopPhoneCamera() {
   if (phoneStream) phoneStream.getTracks().forEach(track => track.stop());
   phoneStream = null;
   phoneVideo.srcObject = null;
+  livePreview.pause();
+  livePreview.srcObject = null;
+  livePreview.hidden = true;
+  serverVideo.hidden = false;
   phoneBtn.textContent = 'Connect webcam';
   try { await fetch('/api/camera/disconnect', { method: 'POST' }); }
   catch (e) { cameraNote.textContent = 'Could not notify the server that the camera disconnected.'; }
@@ -816,7 +823,11 @@ phoneBtn.onclick = async () => {
       audio: false
     });
     phoneVideo.srcObject = phoneStream;
+    livePreview.srcObject = phoneStream;
+    serverVideo.hidden = true;
+    livePreview.hidden = false;
     await phoneVideo.play();
+    await livePreview.play();
     await waitForVideoMetadata();
     phoneBtn.textContent = 'Disconnect webcam';
     cameraNote.textContent = 'Webcam connected. Motion detection is active.';
