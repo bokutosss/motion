@@ -3,6 +3,7 @@ import threading
 
 import app as motion
 from camera_runtime import detector_loop
+from flask import request
 
 # The frame endpoint caps uploads at 1920x1080. Scale portrait phone video by
 # both dimensions so frames are not rejected and the camera marked offline.
@@ -45,6 +46,16 @@ motion.DASHBOARD = motion.DASHBOARD.replace(
     "  serverVideo.hidden = false;\n"
     "  phoneBtn.textContent = 'Connect webcam';",
 )
+
+# Mark the camera online as soon as the browser successfully uploads a valid
+# frame. The detector loop will mark it offline again if frames go stale.
+@motion.app.after_request
+def mark_camera_online(response):
+    if request.endpoint == "api_camera_frame" and response.status_code == 200:
+        with motion.state.frame_cond:
+            motion.state.camera_ok = True
+    return response
+
 
 app = motion.app
 threading.Thread(target=detector_loop, daemon=True).start()
